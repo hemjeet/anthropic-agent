@@ -130,7 +130,7 @@ def run_tool(tool_name, tool_input):
         print(f"Subject: {tool_input['subject']}")
         print("="*50)
         confirm = input("\nDo you want to send this email now? (y/n): ").strip()
-        if confirm.lower() == 'yes':
+        if confirm.lower() == 'y':
             print('Sending....')
             return send_email(
                 tool_input["to_email"],
