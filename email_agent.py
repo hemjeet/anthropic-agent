@@ -270,13 +270,13 @@ def chat(user_input):
 # ── Run it ─────────────────────────────────────────────────
 # With this:
 if __name__ == "__main__":
-    print("📧 Email Agent")
+    print("Email Agent")
     print("-" * 40)
     print("TIP: Use forward slashes in path. Example:")
     print("     E:/anthropic/kumar_resume.pdf\n")
 
     resume_path = input("Enter path to your resume: ").strip()
-    resume_path = resume_path.replace("\\", "/")  # fix anyway just in case
+    resume_path = resume_path.replace("\\", "/")  
 
     if not os.path.exists(resume_path):
         print(f"File not found: {resume_path}")
