@@ -1,6 +1,8 @@
 import anthropic
 import smtplib
 import os
+import hashlib
+import re
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -10,6 +12,19 @@ import PyPDF2
 
 load_dotenv()
 client = anthropic.Anthropic()
+
+# ── Global Cost & Tracking State ───────────────────────────
+total_input_tokens = 0
+total_output_tokens = 0
+applied_job_hashes = set()
+
+def sanitize_input(job_post: str) -> str:
+    """Removes common prompt injection phrases and wraps in XML tags."""
+    malicious_phrases = ["ignore previous instructions", "system prompt", "you are now"]
+    sanitized = job_post
+    for phrase in malicious_phrases:
+        sanitized = re.sub(phrase, "", sanitized, flags=re.IGNORECASE)
+    return f"<job_description>\n{sanitized.strip()}\n</job_description>"
 
 # ── Read resume once at start ──────────────────────────────
 def read_resume(path: str = "resume.pdf") -> str:
@@ -77,8 +92,32 @@ tools = [
 
 # ── Tool functions ─────────────────────────────────────────
 def write_cover_letter(subject: str, body: str) -> str:
-    """Just returns the draft — actual writing done by Claude"""
-    return f"SUBJECT: {subject}\n\nBODY:\n{body}"
+    global total_input_tokens, total_output_tokens
+    print("\n🔍 Reviewer Agent is checking the cover letter...")
+    
+    review_prompt = f"""You are an expert copywriter reviewing a cover letter.
+Make sure the tone is professional, grammar is perfect, and it reads naturally.
+Fix any issues and return ONLY the final polished cover letter body. Do not include any extra commentary.
+    
+DRAFT COVER LETTER:
+{body}"""
+
+    try:
+        response = client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=1024,
+            system=review_prompt,
+            messages=[{"role": "user", "content": "Review and fix this cover letter."}]
+        )
+        total_input_tokens += response.usage.input_tokens
+        total_output_tokens += response.usage.output_tokens
+        
+        polished_body = response.content[0].text.strip()
+        print("✨ Reviewer Agent has polished the letter.")
+        return f"SUBJECT: {subject}\n\nBODY:\n{polished_body}"
+    except Exception as e:
+        print(f"Reviewer Agent failed: {e}. Using original draft.")
+        return f"SUBJECT: {subject}\n\nBODY:\n{body}"
 
 # ── Make resume_path a global so send_email can use it ────
 resume_path = None   # declare at top of file
@@ -150,12 +189,23 @@ messages = []
 
 # ── Agent loop ─────────────────────────────────────────────
 def chat(user_input):
+    global total_input_tokens, total_output_tokens
     print(f"\nYou: {user_input}")
     print("-" * 50)
 
+    # Duplicate check for long inputs (assumed to be job descriptions)
+    if len(user_input) > 50:
+        job_hash = hashlib.sha256(user_input.encode()).hexdigest()
+        if job_hash in applied_job_hashes:
+            print("\nDuplicate Detected: You have already processed this exact job post in this session. Skipping to save tokens.")
+            return
+        applied_job_hashes.add(job_hash)
+
+    sanitized_input = sanitize_input(user_input) if len(user_input) > 50 else user_input
+
     messages.append({
         "role": "user",
-        "content": user_input
+        "content": sanitized_input
     })
 
     step = 0
@@ -201,24 +251,46 @@ def chat(user_input):
     """
     while step < max_steps:
         step += 1
+        # ── Context Window Management ──────────────────────
+        MAX_HISTORY = 20
+        if len(messages) > MAX_HISTORY:
+            keep_msg = messages[-MAX_HISTORY:]
+            if keep_msg[0]["role"] == "assistant":
+                keep_msg = keep_msg[1:]
+            messages[:] = keep_msg
 
         response = client.messages.create(
             model="claude-haiku-4-5",
             max_tokens=2048,
-            system=system_prompt,
+            system=[
+                {
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"}
+                }
+            ],
             tools=tools,
             messages=messages
         )
+        
+        total_input_tokens += (response.usage.input_tokens)
+        total_output_tokens += (response.usage.output_tokens)
 
         # ── Done ──────────────────────────────────────────
         if response.stop_reason == "end_turn":
+            assistant_content = []
             for block in response.content:
                 if hasattr(block, "text"):
                     print(f"\nAgent: {block.text}")
-                    messages.append({
-                        "role": "assistant",
-                        "content": block.text
+                    assistant_content.append({
+                        "type": "text",
+                        "text": block.text
                     })
+            if assistant_content:
+                messages.append({
+                    "role": "assistant",
+                    "content": assistant_content
+                })
             break
 
         # ── Tool use ───────────────────────────────────────
@@ -268,7 +340,6 @@ def chat(user_input):
             })
 
 # ── Run it ─────────────────────────────────────────────────
-# With this:
 if __name__ == "__main__":
     print("Email Agent")
     print("-" * 40)
@@ -296,3 +367,13 @@ if __name__ == "__main__":
             print("Goodbye!")
             break
         chat(user_input)
+
+    # Calculate and print cost at exit
+    cost_in = (total_input_tokens / 1_000_000) * 0.25
+    cost_out = (total_output_tokens / 1_000_000) * 1.25
+    print("\n" + "="*40)
+    print("SESSION COST SUMMARY")
+    print(f"Input Tokens:  {total_input_tokens} (${cost_in:.4f})")
+    print(f"Output Tokens: {total_output_tokens} (${cost_out:.4f})")
+    print(f"Total Cost:    ${cost_in + cost_out:.4f}")
+    print("="*40)
